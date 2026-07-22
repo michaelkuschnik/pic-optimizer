@@ -3,7 +3,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QListView, QPushButton,
     QLabel, QSizePolicy, QStyledItemDelegate, QStyle, QMessageBox
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QSize, QThreadPool, QRunnable, QObject, QRect
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QThreadPool, QRunnable, QObject, QRect, QTimer
 from PyQt6.QtGui import QStandardItemModel, QStandardItem, QIcon, QPixmap, QColor, QPainter, QFont
 
 from app.utils.image_loader import is_supported, is_video
@@ -373,8 +373,25 @@ class GalleryScreen(QWidget):
             item.setData("", DATE_ROLE)
             item.setSizeHint(QSize(CELL_SIZE, THUMB_SIZE + LABEL_H + 8))
             self._model.appendRow(item)
-            self._schedule_thumbnail(i, f)
-            self._schedule_date(i, f)
+
+        # Sichtbare Thumbnails zuerst laden (~30 im Viewport), Rest verzögert
+        visible_count = min(len(files), 30)
+        for i in range(visible_count):
+            self._schedule_thumbnail(i, files[i])
+            self._schedule_date(i, files[i])
+        if len(files) > visible_count:
+            self._pending_batch = list(range(visible_count, len(files)))
+            QTimer.singleShot(100, self._schedule_remaining_batch)
+
+    def _schedule_remaining_batch(self):
+        """Lädt Thumbnails für Dateien außerhalb des sichtbaren Bereichs."""
+        if not hasattr(self, '_pending_batch'):
+            return
+        for i in self._pending_batch:
+            if i < len(self._files):
+                self._schedule_thumbnail(i, self._files[i])
+                self._schedule_date(i, self._files[i])
+        del self._pending_batch
 
     def _schedule_thumbnail(self, index: int, path: Path):
         worker = ThumbnailWorker(index, path)

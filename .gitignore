@@ -10,3 +10,4 @@ startup_debug.log
 startup_error.log
 test_stderr.txt
 test_stderr2.txt
+.optimizer_cache/

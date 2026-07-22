@@ -5,12 +5,43 @@ from PyQt6.QtWidgets import (
     QSlider, QSpinBox, QFormLayout, QComboBox,
     QScrollArea, QCheckBox, QMessageBox,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QSize, QRect, QRectF, QPoint, QThread
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QRect, QRectF, QPoint, QThread, QTimer
 from PyQt6.QtGui import QPixmap, QImage, QFont, QAction, QPainter, QPen, QColor, QCursor, QPainterPath, QBrush, QShortcut, QKeySequence
+
+import zlib
 
 from PIL import Image, ImageEnhance
 from app.utils.image_loader import load_image
 from app.workers.thumbnail_worker import _pil_to_pixmap
+
+
+class CompressedImageStore:
+    """Speichert PIL-Bilder als zlib-komprimierte Rohdaten (spart 60-90% RAM)."""
+
+    def __init__(self, max_entries: int = 30):
+        self._entries: list[tuple[bytes, str, tuple[int, int]]] = []
+        self._max = max_entries
+
+    def push(self, img: Image.Image) -> None:
+        if len(self._entries) >= self._max:
+            self._entries.pop(0)
+        raw = img.tobytes()
+        compressed = zlib.compress(raw, level=1)
+        self._entries.append((compressed, img.mode, img.size))
+
+    def pop(self) -> Image.Image:
+        compressed, mode, size = self._entries.pop()
+        raw = zlib.decompress(compressed)
+        return Image.frombytes(mode, size, raw)
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __bool__(self) -> bool:
+        return len(self._entries) > 0
 
 
 # ── Interaktiver Bild-Canvas ──────────────────────────────────────────────────
@@ -821,13 +852,37 @@ class HistogramWidget(QWidget):
         super().__init__(parent)
         self._data: list[list[int]] = []   # [[R×256], [G×256], [B×256]]
         self._lum: list[float] = []        # Luminanz-Kanal
+        self._pending_img = None           # Bild für verzögerte Berechnung
+        self._throttle_timer = QTimer(self)
+        self._throttle_timer.setSingleShot(True)
+        self._throttle_timer.setInterval(150)  # 150 ms Throttle
+        self._throttle_timer.timeout.connect(self._apply_pending)
         self.setFixedHeight(110)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setToolTip("Histogramm: Rot / Grün / Blau / Luminanz")
 
-    def set_image(self, img):
+    def set_image(self, img, immediate: bool = False):
+        """Histogrammdaten berechnen. Bei immediate=False wird gedrosselt (150 ms)."""
+        if immediate:
+            self._compute_histogram(img)
+            return
+        self._pending_img = img
+        if not self._throttle_timer.isActive():
+            self._throttle_timer.start()
+
+    def _apply_pending(self):
+        if self._pending_img is not None:
+            self._compute_histogram(self._pending_img)
+            self._pending_img = None
+
+    def _compute_histogram(self, img):
         """Histogrammdaten aus PIL-Bild berechnen und glätten."""
         try:
+            # Downsampling für schnelle Berechnung bei großen Bildern
+            w, h = img.size
+            if max(w, h) > 1000:
+                factor = max(w, h) // 1000
+                img = img.resize((w // factor, h // factor), Image.NEAREST)
             rgb = img.convert("RGB")
             raw = rgb.histogram()          # 768 Werte: R[0..255], G[0..255], B[0..255]
             r = raw[0:256]
@@ -959,7 +1014,7 @@ class EditorScreen(QWidget):
         self._original_at_load: Image.Image | None = None   # echtes Ur-Original (aus Backup)
         self._original_file_path: Path | None = None        # Ziel-Dateipfad (für Restore)
         self._backup_path: Path | None = None               # Backup-Pfad (.optimizer_originals/)
-        self._history: list[Image.Image] = []               # Undo-Stack
+        self._history = CompressedImageStore(max_entries=30)  # Undo-Stack (komprimiert)
         self._file_path: Path | None = None
         self._active_adjust_slider: QSlider | None = None
         self._fine_rotate_base: Image.Image | None = None  # Basis für akkumulierte Feinrotation
@@ -976,6 +1031,8 @@ class EditorScreen(QWidget):
         self._crop_base: Image.Image | None = None          # Basis vor letztem Crop (für Zurücksetzen)
         self._ent_base_small: Image.Image | None = None     # Skaliertes Bild für Schnellvorschau
         self._adj_base: Image.Image | None = None           # Basis für Anpassen-Live-Preview
+        self._adj_preview_img: Image.Image | None = None   # Herunterskaliert für schnelle Slider-Vorschau
+        self._adj_scale_factor: int = 1                    # Skalierungsfaktor für Preview
         self._quad_img_points: list[tuple] = []             # 4-Punkt-Perspektiv-Warp Bildkoordinaten
         self._geo_worker: "_GeoWorker | None" = None
         self._old_geo_workers: list = []   # verhindert GC während Thread läuft
@@ -1838,9 +1895,7 @@ class EditorScreen(QWidget):
             return
         # Ausstehende Preview zuerst in die History einbacken (eigener History-Eintrag)
         if self._has_active_preview():
-            if len(self._history) >= 30:
-                self._history.pop(0)
-            self._history.append(self._original.copy())   # Stand VOR dem Preview
+            self._history.push(self._original)   # Stand VOR dem Preview
             # Preview auf _original anwenden
             if self._focus_base is not None and self._focus_mask is not None:
                 from PIL import ImageFilter
@@ -1851,9 +1906,7 @@ class EditorScreen(QWidget):
             self._hg_base = None
             self._focus_mask = None
             self._focus_base = None
-        if len(self._history) >= 30:
-            self._history.pop(0)
-        self._history.append(self._original.copy())
+        self._history.push(self._original)
         if not keep_fine_base:
             self._fine_rotate_base = None
             self._fine_rotate_total = 0.0
@@ -1863,10 +1916,34 @@ class EditorScreen(QWidget):
         return (self._hg_mask is not None or self._hg_base is not None
                 or self._focus_mask is not None or self._focus_base is not None)
 
+    def _clear_bases(self, keep: str | None = None):
+        """Löscht alle Tool-Basis-Bilder außer dem angegebenen (spart RAM)."""
+        if keep != "fine_rotate":
+            self._fine_rotate_base = None
+            self._fine_rotate_total = 0.0
+        if keep != "adj":
+            self._adj_base = None
+            self._adj_preview_img = None
+            self._adj_scale_factor = 1
+        if keep != "ent":
+            self._ent_base = None
+            self._ent_base_small = None
+            self._distortion_base = None
+        if keep != "focus":
+            self._focus_base = None
+            self._focus_mask = None
+        if keep != "quad":
+            self._quad_base = None
+        if keep != "crop":
+            self._crop_base = None
+        if keep != "hg":
+            self._hg_base = None
+            self._hg_mask = None
+
     def _show_original(self):
         """Zeigt self._original auf dem Canvas und aktualisiert das Histogramm."""
         self._canvas.set_image(self._original)
-        self._histogram.set_image(self._original)
+        self._histogram.set_image(self._original, immediate=True)
 
     def _update_action_buttons(self):
         has_history = len(self._history) > 0
@@ -2012,6 +2089,8 @@ class EditorScreen(QWidget):
         self._fine_rotate_base = None
         self._fine_rotate_total = 0.0
         self._adj_base = None
+        self._adj_preview_img = None
+        self._adj_scale_factor = 1
         self._ent_base = None
         self._distortion_base = None
         self._quad_base = None
@@ -2084,12 +2163,32 @@ class EditorScreen(QWidget):
             self._quad_count_lbl.setText("0 / 4 Punkte")
             self._quad_apply_btn.setEnabled(False)
 
+        # Nicht-aktive Tool-Bases freigeben (RAM sparen)
+        if checked:
+            _base_map = {
+                "bewegen": "fine_rotate", "zuschneiden": "crop",
+                "anpassen": "adj", "entzerren": "ent",
+                "hintergrund": "hg", "fokus": "focus",
+            }
+            self._clear_bases(keep=_base_map.get(key))
+
         # Anpassen: Basis beim Öffnen setzen, beim Schließen committen
         if key == "anpassen":
             if checked:
                 self._adj_base = self._original.copy() if self._original else None
+                # Preview-Bild für schnelle Slider-Interaktion
+                if self._adj_base is not None:
+                    iw, ih = self._adj_base.size
+                    max_preview = 1500
+                    factor = max(1, max(iw, ih) // max_preview)
+                    self._adj_scale_factor = factor
+                    if factor > 1:
+                        self._adj_preview_img = self._adj_base.resize(
+                            (iw // factor, ih // factor), Image.BILINEAR)
+                    else:
+                        self._adj_preview_img = None
                 if self._original:
-                    self._adj_histogram.set_image(self._original)
+                    self._adj_histogram.set_image(self._original, immediate=True)
             else:
                 self._adj_commit()
 
@@ -3051,12 +3150,25 @@ class EditorScreen(QWidget):
     def _adj_press(self):
         if self._original and self._adj_base is None:
             self._adj_base = self._original.copy()
+            # Preview-Bild für schnelle Slider-Interaktion erstellen
+            iw, ih = self._adj_base.size
+            max_preview = 1500
+            factor = max(1, max(iw, ih) // max_preview)
+            self._adj_scale_factor = factor
+            if factor > 1:
+                self._adj_preview_img = self._adj_base.resize(
+                    (iw // factor, ih // factor), Image.BILINEAR)
+            else:
+                self._adj_preview_img = None
 
     def _adj_preview(self):
         if self._adj_base is None:
             return
-        result = self._compute_adjustments(self._adj_base)
+        preview_base = self._adj_preview_img if self._adj_preview_img is not None else self._adj_base
+        result = self._compute_adjustments(preview_base)
         if result is not None:
+            if self._adj_preview_img is not None:
+                result = result.resize(self._adj_base.size, Image.BILINEAR)
             self._canvas.set_image(result)
             self._adj_histogram.set_image(result)
 
@@ -3069,6 +3181,8 @@ class EditorScreen(QWidget):
             self._original = result
             self._show_original()
         self._adj_base = None
+        self._adj_preview_img = None
+        self._adj_scale_factor = 1
 
     def _adj_reset_all(self):
         """Reset all Anpassen sliders to neutral and restore canvas to session base."""
@@ -3080,7 +3194,7 @@ class EditorScreen(QWidget):
         base = self._adj_base if self._adj_base is not None else self._original
         if base is not None:
             self._canvas.set_image(base)
-            self._adj_histogram.set_image(base)
+            self._adj_histogram.set_image(base, immediate=True)
 
     def _compute_adjustments(self, base: Image.Image) -> Image.Image:
         import numpy as np
@@ -3175,7 +3289,7 @@ class EditorScreen(QWidget):
         if not self._original or not self._file_path:
             return
 
-        self._histogram.set_image(self._original)
+        self._histogram.set_image(self._original, immediate=True)
 
         w, h = self._original.width, self._original.height
         mp = w * h / 1_000_000

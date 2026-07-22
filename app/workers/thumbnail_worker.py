@@ -24,6 +24,15 @@ class ThumbnailWorker(QRunnable):
 
     def run(self):
         try:
+            from app.utils.thumb_cache import get_cached_thumbnail, save_cached_thumbnail
+
+            # Cache-Check zuerst
+            cached = get_cached_thumbnail(self.path, THUMB_SIZE)
+            if cached is not None:
+                pixmap = _pil_to_pixmap(cached)
+                self.signals.ready.emit(self.index, pixmap)
+                return
+
             if is_video(self.path):
                 img = extract_video_thumbnail(self.path, THUMB_SIZE)
             elif is_image(self.path):
@@ -35,6 +44,9 @@ class ThumbnailWorker(QRunnable):
             if img is None:
                 self.signals.error.emit(self.index)
                 return
+
+            # In Cache speichern
+            save_cached_thumbnail(self.path, img)
 
             pixmap = _pil_to_pixmap(img)
             self.signals.ready.emit(self.index, pixmap)
