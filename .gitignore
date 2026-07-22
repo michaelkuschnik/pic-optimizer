@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+debug_console.txt
+debug_thumb.txt
+diag_err.txt
+diag_out.txt
+error_log.txt
+startup_debug.log
+startup_error.log
+test_stderr.txt
+test_stderr2.txt

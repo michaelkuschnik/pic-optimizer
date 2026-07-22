@@ -1,0 +1,9 @@
+PyQt6>=6.6.0
+Pillow>=10.0.0
+rawpy>=0.18.0
+pillow-heif>=0.13.0
+ffmpeg-python>=0.2.0
+opencv-python>=4.8.0
+rembg>=2.0.50
+numpy>=1.24.0
+shapely>=2.0.0
