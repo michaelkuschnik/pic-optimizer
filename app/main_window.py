@@ -16,6 +16,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.stack)
 
         self._setup_menu()
+        self._setup_screens()
 
     def _setup_menu(self):
         menubar = self.menuBar()
@@ -29,7 +30,7 @@ class MainWindow(QMainWindow):
         dlg = HelpDialog(self)
         dlg.exec()
 
-
+    def _setup_screens(self):
         from app.screens.folder_screen import FolderScreen
         from app.screens.gallery_screen import GalleryScreen
         from app.screens.editor_screen import EditorScreen
